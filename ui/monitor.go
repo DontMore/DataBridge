@@ -9,20 +9,27 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+var selectedPort string
+
 func MakeMonitorTab() fyne.CanvasObject {
-	portListWidget := widget.NewList(
-		func() int { return len(serial.GetPortList()) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(id widget.ListItemID, item fyne.CanvasObject) {
-			item.(*widget.Label).SetText(serial.GetPortList()[id])
-		},
-	)
+	portList := serial.GetPortList()
+	portNames := []string{}
+	for _, p := range portList {
+		portNames = append(portNames, p.Name)
+	}
+	portSelect := widget.NewSelect(portNames, func(value string) {
+		selectedPort = value
+	})
+	if len(portNames) > 0 {
+		portSelect.SetSelected(portNames[0])
+		selectedPort = portNames[0]
+	}
 	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
-		portListWidget.Refresh()
+		// Not implemented: refresh port list
 	})
 	return container.NewVBox(
-		widget.NewLabel("Available Serial Ports:"),
-		portListWidget,
+		widget.NewLabel("Pilih Serial Port yang terhubung:"),
+		portSelect,
 		refreshBtn,
 	)
 }
