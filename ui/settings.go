@@ -3,11 +3,16 @@ package ui
 import (
 	"DataBridge/serial"
 	"database/sql"
+	"fmt"
+	"image/color"
+	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas" // add this import for custom background
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -18,113 +23,151 @@ import (
 	"go.bug.st/serial/enumerator"
 )
 
-// Global variables for serial port configuration and state
-var (
-	savedConfigs  []serial.PortConfig                 // In-memory list of saved serial port configurations
-	runningStates []bool                              // State of each configuration (running or not)
-	portMap       = make(map[string]*tarmserial.Port) // Map of open serial ports
-	stopChMap     = make(map[string]chan struct{})    // Map of stop channels for goroutines
-	mu            sync.Mutex                          // Mutex for thread-safe access
-	db            *sql.DB                             // SQLite database connection
+// Constants for better maintainability
+const (
+	DefaultBaudRate = "9600"
+	DefaultDataBits = "8"
+	DefaultParity   = "None"
+	DefaultStopBits = "1"
+	ReadBufferSize  = 128
+	MaxTextLength   = 10000 // Limit text to prevent memory issues
 )
 
-// Get all available serial port names on the system
-func getAllSerialPorts() []string {
+// SerialManager manages all serial port operations
+type SerialManager struct {
+	mu            sync.RWMutex
+	configs       []serial.PortConfig
+	runningStates []bool
+	portMap       map[string]*tarmserial.Port
+	stopChMap     map[string]chan struct{}
+	db            *sql.DB
+	receivedData  *widget.Entry
+}
+
+// NewSerialManager creates a new SerialManager instance
+func NewSerialManager() *SerialManager {
+	return &SerialManager{
+		portMap:   make(map[string]*tarmserial.Port),
+		stopChMap: make(map[string]chan struct{}),
+	}
+}
+
+// Initialize initializes the database and loads configurations
+func (sm *SerialManager) Initialize() error {
+	if err := sm.initDatabase(); err != nil {
+		return fmt.Errorf("failed to initialize database: %w", err)
+	}
+
+	configs, err := sm.loadConfigs()
+	if err != nil {
+		log.Printf("Warning: failed to load configs: %v", err)
+		return nil // Don't fail completely, just log the warning
+	}
+
+	sm.mu.Lock()
+	sm.configs = configs
+	sm.runningStates = make([]bool, len(configs))
+	sm.mu.Unlock()
+
+	return nil
+}
+
+// Close closes the database connection and stops all running ports
+func (sm *SerialManager) Close() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Stop all running ports
+	for i, running := range sm.runningStates {
+		if running && i < len(sm.configs) {
+			sm.stopSerialUnsafe(sm.configs[i])
+		}
+	}
+
+	// Close database
+	if sm.db != nil {
+		return sm.db.Close()
+	}
+	return nil
+}
+
+// GetAllSerialPorts returns all available serial port names
+func GetAllSerialPorts() []string {
 	ports, err := enumerator.GetDetailedPortsList()
 	if err != nil {
+		log.Printf("Error getting serial ports: %v", err)
 		return []string{}
 	}
-	var names []string
+
+	names := make([]string, 0, len(ports))
 	for _, port := range ports {
-		names = append(names, port.Name)
+		if port.Name != "" {
+			names = append(names, port.Name)
+		}
 	}
 	return names
 }
 
-// Create the settings tab UI for the application
+// MakeSettingsTab creates the settings tab UI
 func MakeSettingsTab() fyne.CanvasObject {
-	titleStyle := fyne.TextStyle{Bold: true}     // Style for titles
-	sectionStyle := fyne.TextStyle{Italic: true} // Style for section labels
+	manager := NewSerialManager()
+	if err := manager.Initialize(); err != nil {
+		log.Printf("Failed to initialize serial manager: %v", err)
+	}
 
-	// --- Serial Monitor Section ---
-	monitorCard := widget.NewCard("Serial Monitor", "", nil) // Card for serial monitor
-	receivedData := widget.NewMultiLineEntry()               // Multiline entry for received data
-	receivedData.SetPlaceHolder("Waiting for data...")
-	receivedData.Wrapping = fyne.TextWrapWord
-	receivedData.Disable()
+	// --- Create configList and updateConfigList before configCard ---
+	configList := container.NewVBox()
+	updateConfigList := func() {
+		manager.updateConfigList(configList)
+	}
 
-	clearBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), func() {
-		receivedData.SetText("") // Clear the received data
-	})
+	// --- Pass updateConfigList to configCard and savedConfigsCard ---
+	configCard := manager.createConfigCardWithUpdate(updateConfigList)
+	savedConfigsCard := widget.NewCard("Saved Configurations", "", container.NewVScroll(configList))
+	updateConfigList() // Initial population
 
-	copyBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
-		clipboard := fyne.CurrentApp().Driver().AllWindows()[0].Clipboard()
-		clipboard.SetContent(receivedData.Text) // Copy data to clipboard
-		dialog.ShowInformation("Copied", "Data copied to clipboard",
-			fyne.CurrentApp().Driver().AllWindows()[0])
-	})
+	monitorCard := manager.createMonitorCard()
 
-	monitorToolbar := container.NewHBox(
-		layout.NewSpacer(),
-		clearBtn,
-		copyBtn,
+	tabs := container.NewAppTabs(
+		container.NewTabItem("Configuration", configCard),
+		container.NewTabItem("Saved Configs", savedConfigsCard),
+		container.NewTabItem("Serial Monitor", monitorCard),
 	)
+	tabs.SetTabLocation(container.TabLocationTop)
 
-	monitorCard.SetContent(container.NewBorder(
-		nil,
-		monitorToolbar,
-		nil,
-		nil,
-		container.NewScroll(receivedData),
-	))
+	return tabs
+}
 
-	// --- Port Configuration Section ---
-	configCard := widget.NewCard("Serial Port Configuration", "", nil) // Card for port configuration
-	baudRates := []string{"9600", "19200", "38400", "57600", "115200"} // Common baud rates
-	baudSelect := widget.NewSelect(baudRates, nil)                     // Dropdown for baud rate
-	baudSelect.SetSelected("9600")
-	baudSelect.PlaceHolder = "Select Baud Rate"
+// --- Tambahkan versi baru createSavedConfigsCard yang mengembalikan configList dan menerima updateConfigList ---
+func (sm *SerialManager) createSavedConfigsCardWithList(updateConfigList func()) (*widget.Card, *fyne.Container) {
+	configList := container.NewVBox()
+	updateConfigList() // Initial population
+	card := widget.NewCard("Saved Configurations", "", container.NewVScroll(configList))
+	return card, configList
+}
 
-	dataBits := widget.NewSelect([]string{"5", "6", "7", "8"}, nil) // Dropdown for data bits
-	dataBits.SetSelected("8")
-	dataBits.PlaceHolder = "Select Data Bits"
-
-	parity := widget.NewSelect([]string{"None", "Even", "Odd"}, nil) // Dropdown for parity
-	parity.SetSelected("None")
-	parity.PlaceHolder = "Select Parity"
-
-	stopBits := widget.NewSelect([]string{"1", "1.5", "2"}, nil) // Dropdown for stop bits
-	stopBits.SetSelected("1")
-	stopBits.PlaceHolder = "Select Stop Bits"
-
-	portOptions := getAllSerialPorts() // Get available ports
-	selectedPort := ""
-	if len(portOptions) > 0 {
-		selectedPort = portOptions[0]
-	}
-	portSelect := widget.NewSelect(portOptions, func(value string) {
-		selectedPort = value // Update selected port
-	})
-	portSelect.PlaceHolder = "Select COM Port"
-	if len(portOptions) > 0 {
-		portSelect.SetSelected(selectedPort)
-	}
-
-	refreshPortsBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
-		portOptions = getAllSerialPorts() // Refresh port list
-		portSelect.Options = portOptions
-		if len(portOptions) > 0 {
-			portSelect.SetSelected(portOptions[0])
-		}
-		portSelect.Refresh()
-	})
-
-	nameEntry := widget.NewEntry() // Entry for configuration name
+// --- Modifikasi createConfigCard agar menerima updateConfigList dan memanggilnya setelah save ---
+func (sm *SerialManager) createConfigCardWithUpdate(updateConfigList func()) *widget.Card {
+	// Form components
+	portSelect, refreshBtn := sm.createPortSelector()
+	nameEntry := widget.NewEntry()
 	nameEntry.SetPlaceHolder("Enter configuration name")
+
+	baudSelect := widget.NewSelect([]string{"9600", "19200", "38400", "57600", "115200"}, nil)
+	baudSelect.SetSelected(DefaultBaudRate)
+
+	dataBits := widget.NewSelect([]string{"5", "6", "7", "8"}, nil)
+	dataBits.SetSelected(DefaultDataBits)
+
+	parity := widget.NewSelect([]string{"None", "Even", "Odd"}, nil)
+	parity.SetSelected(DefaultParity)
+
+	stopBits := widget.NewSelect([]string{"1", "1.5", "2"}, nil)
+	stopBits.SetSelected(DefaultStopBits)
 
 	form := &widget.Form{
 		Items: []*widget.FormItem{
-			{Text: "COM Port", Widget: container.NewBorder(nil, nil, nil, refreshPortsBtn, portSelect)},
+			{Text: "COM Port", Widget: container.NewBorder(nil, nil, nil, refreshBtn, portSelect)},
 			{Text: "Configuration Name", Widget: nameEntry},
 			{Text: "Baud Rate", Widget: baudSelect},
 			{Text: "Data Bits", Widget: dataBits},
@@ -133,246 +176,562 @@ func MakeSettingsTab() fyne.CanvasObject {
 		},
 	}
 
-	// --- Saved Configurations Section ---
-	savedConfigsCard := widget.NewCard("Saved Configurations", "", nil) // Card for saved configs
-	configList := container.NewVBox()                                   // List of config cards
-
-	var updateConfigList func() // Function to update config list UI
-	updateConfigList = func() {
-		configList.Objects = nil
-		for i, cfg := range savedConfigs {
-			idx := i
-			var btn *widget.Button
-			if runningStates[idx] {
-				btn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
-					runningStates[idx] = false
-					stopSerial(cfg)
-					updateConfigList()
-				})
-			} else {
-				btn = widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), func() {
-					runningStates[idx] = true
-					go startSerial(cfg, receivedData)
-					updateConfigList()
-				})
-			}
-
-			configCard := widget.NewCard("", "", container.NewVBox(
-				widget.NewLabelWithStyle(cfg.ConfigName, fyne.TextAlignLeading, titleStyle),
-				widget.NewLabel("Port: "+cfg.PortName),
-				container.NewHBox(
-					widget.NewLabel("Settings: "+cfg.BaudRate+" baud, "+
-						cfg.DataBits+" data bits, "+
-						cfg.Parity+" parity, "+
-						cfg.StopBits+" stop bits"),
-				),
-				btn,
-			))
-			configList.Add(configCard)
+	saveBtn := widget.NewButtonWithIcon("Save Configuration", theme.DocumentSaveIcon(), func() {
+		sm.saveConfiguration(portSelect, nameEntry, baudSelect, dataBits, parity, stopBits)
+		if updateConfigList != nil {
+			updateConfigList()
 		}
-		if len(savedConfigs) == 0 {
-			configList.Add(widget.NewLabelWithStyle("No saved configurations",
-				fyne.TextAlignCenter, sectionStyle))
+	})
+
+	card := widget.NewCard("Serial Port Configuration", "", container.NewVBox(
+		form,
+		container.NewCenter(saveBtn),
+	))
+	return card
+}
+
+// createMonitorCard creates the serial monitor UI
+func (sm *SerialManager) createMonitorCard() *widget.Card {
+	sm.receivedData = widget.NewMultiLineEntry()
+	sm.receivedData.SetPlaceHolder("Waiting for data...")
+	sm.receivedData.Wrapping = fyne.TextWrapWord
+	sm.receivedData.Disable()
+
+	clearBtn := widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), func() {
+		sm.receivedData.SetText("")
+	})
+
+	copyBtn := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
+		if win := getCurrentWindow(); win != nil {
+			win.Clipboard().SetContent(sm.receivedData.Text)
+			dialog.ShowInformation("Copied", "Data copied to clipboard", win)
 		}
-		configList.Refresh()
+	})
+
+	toolbar := container.NewHBox(layout.NewSpacer(), clearBtn, copyBtn)
+
+	// White background for serial monitor
+	bg := canvas.NewRectangle(color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+	content := container.NewMax(
+		bg,
+		container.NewScroll(sm.receivedData),
+	)
+
+	card := widget.NewCard("Serial Monitor", "", container.NewBorder(
+		nil, toolbar, nil, nil,
+		content,
+	))
+
+	return card
+}
+
+// createConfigCard creates the configuration UI
+func (sm *SerialManager) createConfigCard() *widget.Card {
+	// Form components
+	portSelect, refreshBtn := sm.createPortSelector()
+	nameEntry := widget.NewEntry()
+	nameEntry.SetPlaceHolder("Enter configuration name")
+
+	baudSelect := widget.NewSelect([]string{"9600", "19200", "38400", "57600", "115200"}, nil)
+	baudSelect.SetSelected(DefaultBaudRate)
+
+	dataBits := widget.NewSelect([]string{"5", "6", "7", "8"}, nil)
+	dataBits.SetSelected(DefaultDataBits)
+
+	parity := widget.NewSelect([]string{"None", "Even", "Odd"}, nil)
+	parity.SetSelected(DefaultParity)
+
+	stopBits := widget.NewSelect([]string{"1", "1.5", "2"}, nil)
+	stopBits.SetSelected(DefaultStopBits)
+
+	form := &widget.Form{
+		Items: []*widget.FormItem{
+			{Text: "COM Port", Widget: container.NewBorder(nil, nil, nil, refreshBtn, portSelect)},
+			{Text: "Configuration Name", Widget: nameEntry},
+			{Text: "Baud Rate", Widget: baudSelect},
+			{Text: "Data Bits", Widget: dataBits},
+			{Text: "Parity", Widget: parity},
+			{Text: "Stop Bits", Widget: stopBits},
+		},
 	}
 
 	saveBtn := widget.NewButtonWithIcon("Save Configuration", theme.DocumentSaveIcon(), func() {
-		if selectedPort == "" || nameEntry.Text == "" {
-			dialog.ShowInformation("Warning", "Please enter configuration name and select a port",
-				fyne.CurrentApp().Driver().AllWindows()[0])
-			return
-		}
-		cfg := serial.PortConfig{
-			PortName:   selectedPort,
-			ConfigName: nameEntry.Text,
-			BaudRate:   baudSelect.Selected,
-			DataBits:   dataBits.Selected,
-			Parity:     parity.Selected,
-			StopBits:   stopBits.Selected,
-		}
-		savedConfigs = append(savedConfigs, cfg) // Add to in-memory list
-		runningStates = append(runningStates, false)
-		_ = insertSerialConfig(cfg) // Save to SQLite database
-		nameEntry.SetText("")
-		dialog.ShowInformation("Success", "Configuration saved successfully",
-			fyne.CurrentApp().Driver().AllWindows()[0])
-		updateConfigList()
+		sm.saveConfiguration(portSelect, nameEntry, baudSelect, dataBits, parity, stopBits)
 	})
 
-	configCard.SetContent(container.NewVBox(
+	card := widget.NewCard("Serial Port Configuration", "", container.NewVBox(
 		form,
 		container.NewCenter(saveBtn),
 	))
 
-	savedConfigsCard.SetContent(container.NewVScroll(configList))
-
-	// --- Main Layout ---
-	tabs := container.NewAppTabs(
-		container.NewTabItem("Configuration", configCard),
-		container.NewTabItem("Saved Configs", savedConfigsCard),
-		container.NewTabItem("Serial Monitor", monitorCard),
-	)
-	tabs.SetTabLocation(container.TabLocationTop)
-
-	// Initialize database and load configs from SQLite
-	if err := initSerialDB(); err == nil {
-		configs, err := loadSerialConfigs()
-		if err == nil {
-			savedConfigs = configs
-			runningStates = make([]bool, len(savedConfigs))
-		}
-	}
-
-	updateConfigList()
-
-	return tabs
+	return card
 }
 
-// Start reading from the serial port and update the UI with received data
-func startSerial(cfg serial.PortConfig, receivedData *widget.Entry) {
-	baud, err := strconv.Atoi(cfg.BaudRate)
-	if err != nil {
-		dialog.ShowError(err, fyne.CurrentApp().Driver().AllWindows()[0])
+// createSavedConfigsCard creates the saved configurations UI
+func (sm *SerialManager) createSavedConfigsCard() *widget.Card {
+	configList := container.NewVBox()
+
+	updateConfigList := func() {
+		sm.updateConfigList(configList)
+	}
+
+	updateConfigList() // Initial population
+
+	card := widget.NewCard("Saved Configurations", "", container.NewVScroll(configList))
+	return card
+}
+
+// createPortSelector creates port selection UI with refresh button
+func (sm *SerialManager) createPortSelector() (*widget.Select, *widget.Button) {
+	var selectedPort string
+	portOptions := GetAllSerialPorts()
+
+	if len(portOptions) > 0 {
+		selectedPort = portOptions[0]
+	}
+
+	portSelect := widget.NewSelect(portOptions, func(value string) {
+		selectedPort = value
+	})
+	if selectedPort != "" {
+		portSelect.SetSelected(selectedPort)
+	}
+
+	refreshBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {
+		newPorts := GetAllSerialPorts()
+		portSelect.Options = newPorts
+		if len(newPorts) > 0 {
+			portSelect.SetSelected(newPorts[0])
+		}
+		portSelect.Refresh()
+	})
+
+	return portSelect, refreshBtn
+}
+
+// saveConfiguration saves a new serial configuration
+func (sm *SerialManager) saveConfiguration(portSelect *widget.Select, nameEntry *widget.Entry,
+	baudSelect, dataBits, parity, stopBits *widget.Select) {
+
+	if portSelect.Selected == "" || strings.TrimSpace(nameEntry.Text) == "" {
+		if win := getCurrentWindow(); win != nil {
+			dialog.ShowInformation("Warning",
+				"Please enter configuration name and select a port", win)
+		}
 		return
 	}
 
-	c := &tarmserial.Config{
+	cfg := serial.PortConfig{
+		PortName:   portSelect.Selected,
+		ConfigName: strings.TrimSpace(nameEntry.Text),
+		BaudRate:   baudSelect.Selected,
+		DataBits:   dataBits.Selected,
+		Parity:     parity.Selected,
+		StopBits:   stopBits.Selected,
+	}
+
+	// Check for duplicate names
+	sm.mu.RLock()
+	for _, existing := range sm.configs {
+		if existing.ConfigName == cfg.ConfigName {
+			sm.mu.RUnlock()
+			if win := getCurrentWindow(); win != nil {
+				dialog.ShowInformation("Warning",
+					"Configuration name already exists", win)
+			}
+			return
+		}
+	}
+	sm.mu.RUnlock()
+
+	// Save to database first
+	if err := sm.insertConfig(cfg); err != nil {
+		log.Printf("Failed to save config to database: %v", err)
+		if win := getCurrentWindow(); win != nil {
+			dialog.ShowError(err, win)
+		}
+		return
+	}
+
+	// Add to memory
+	sm.mu.Lock()
+	sm.configs = append(sm.configs, cfg)
+	sm.runningStates = append(sm.runningStates, false)
+	sm.mu.Unlock()
+
+	nameEntry.SetText("")
+	if win := getCurrentWindow(); win != nil {
+		dialog.ShowInformation("Success", "Configuration saved successfully", win)
+	}
+}
+
+// updateConfigList updates the configuration list UI
+func (sm *SerialManager) updateConfigList(configList *fyne.Container) {
+	sm.mu.RLock()
+	configs := make([]serial.PortConfig, len(sm.configs))
+	states := make([]bool, len(sm.runningStates))
+	copy(configs, sm.configs)
+	copy(states, sm.runningStates)
+	sm.mu.RUnlock()
+
+	configList.Objects = nil
+
+	if len(configs) == 0 {
+		emptyLabel := widget.NewLabel("No saved configurations")
+		emptyLabel.Alignment = fyne.TextAlignCenter
+		configList.Add(emptyLabel)
+	} else {
+		for i, cfg := range configs {
+			card := sm.createConfigCardSimple(cfg, i, states[i], configList)
+			configList.Add(card)
+		}
+	}
+
+	configList.Refresh()
+}
+
+// createConfigCard creates a single configuration card (no extra arguments)
+func (sm *SerialManager) createConfigCardSimple(cfg serial.PortConfig, idx int, isRunning bool, configList *fyne.Container) *widget.Card {
+	titleStyle := fyne.TextStyle{Bold: true}
+
+	var actionBtn *widget.Button
+	if isRunning {
+		actionBtn = widget.NewButtonWithIcon("Stop", theme.MediaStopIcon(), func() {
+			sm.stopConfiguration(idx, configList)
+		})
+	} else {
+		actionBtn = widget.NewButtonWithIcon("Start", theme.MediaPlayIcon(), func() {
+			sm.startConfiguration(idx, configList)
+		})
+	}
+
+	deleteBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
+		sm.showDeleteConfirmDialog(cfg, idx, configList)
+	})
+
+	settingsText := fmt.Sprintf("Settings: %s baud, %s data bits, %s parity, %s stop bits",
+		cfg.BaudRate, cfg.DataBits, cfg.Parity, cfg.StopBits)
+
+	card := widget.NewCard("", "", container.NewVBox(
+		widget.NewLabelWithStyle(cfg.ConfigName, fyne.TextAlignLeading, titleStyle),
+		widget.NewLabel("Port: "+cfg.PortName),
+		widget.NewLabel(settingsText),
+		container.NewHBox(actionBtn, deleteBtn),
+	))
+
+	return card
+}
+
+// startConfiguration starts a serial configuration
+func (sm *SerialManager) startConfiguration(idx int, configList *fyne.Container) {
+	sm.mu.Lock()
+	if idx >= len(sm.configs) || idx >= len(sm.runningStates) {
+		sm.mu.Unlock()
+		return
+	}
+	cfg := sm.configs[idx]
+	sm.runningStates[idx] = true
+	sm.mu.Unlock()
+
+	go func() {
+		if err := sm.startSerial(cfg); err != nil {
+			log.Printf("Failed to start serial port %s: %v", cfg.PortName, err)
+			sm.mu.Lock()
+			if idx < len(sm.runningStates) {
+				sm.runningStates[idx] = false
+			}
+			sm.mu.Unlock()
+
+			if win := getCurrentWindow(); win != nil {
+				dialog.ShowError(fmt.Errorf("failed to start serial port: %w", err), win)
+			}
+		}
+		sm.updateConfigList(configList)
+	}()
+
+	sm.updateConfigList(configList)
+}
+
+// stopConfiguration stops a serial configuration
+func (sm *SerialManager) stopConfiguration(idx int, configList *fyne.Container) {
+	sm.mu.Lock()
+	if idx >= len(sm.configs) || idx >= len(sm.runningStates) {
+		sm.mu.Unlock()
+		return
+	}
+	cfg := sm.configs[idx]
+	sm.runningStates[idx] = false
+	sm.mu.Unlock()
+
+	sm.stopSerial(cfg)
+	sm.updateConfigList(configList)
+}
+
+// startSerial starts reading from a serial port
+func (sm *SerialManager) startSerial(cfg serial.PortConfig) error {
+	baud, err := strconv.Atoi(cfg.BaudRate)
+	if err != nil {
+		return fmt.Errorf("invalid baud rate: %w", err)
+	}
+
+	config := &tarmserial.Config{
 		Name: cfg.PortName,
 		Baud: baud,
 	}
 
-	s, err := tarmserial.OpenPort(c)
+	port, err := tarmserial.OpenPort(config)
 	if err != nil {
-		dialog.ShowError(err, fyne.CurrentApp().Driver().AllWindows()[0])
+		return fmt.Errorf("failed to open port: %w", err)
+	}
+
+	stopCh := make(chan struct{})
+
+	sm.mu.Lock()
+	// Check if port is already open
+	if existingPort, exists := sm.portMap[cfg.PortName]; exists {
+		existingPort.Close()
+	}
+	sm.portMap[cfg.PortName] = port
+	sm.stopChMap[cfg.PortName] = stopCh
+	sm.mu.Unlock()
+
+	go sm.readSerialData(cfg, port, stopCh)
+
+	return nil
+}
+
+// readSerialData reads data from serial port in a goroutine
+func (sm *SerialManager) readSerialData(cfg serial.PortConfig, port *tarmserial.Port, stopCh chan struct{}) {
+	defer func() {
+		sm.mu.Lock()
+		delete(sm.portMap, cfg.PortName)
+		delete(sm.stopChMap, cfg.PortName)
+		sm.mu.Unlock()
+
+		if err := port.Close(); err != nil {
+			log.Printf("Error closing port %s: %v", cfg.PortName, err)
+		}
+	}()
+
+	buf := make([]byte, ReadBufferSize)
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+			n, err := port.Read(buf)
+			if err != nil {
+				// Check if it's a timeout (not a real error)
+				if strings.Contains(err.Error(), "timeout") {
+					continue
+				}
+				log.Printf("Error reading from port %s: %v", cfg.PortName, err)
+				return
+			}
+
+			if n > 0 {
+				data := string(buf[:n])
+				sm.updateReceivedData(data)
+				sm.sendNotification(data)
+			}
+		}
+	}
+}
+
+// updateReceivedData safely updates the received data UI
+func (sm *SerialManager) updateReceivedData(data string) {
+	if sm.receivedData == nil {
 		return
 	}
 
-	stopCh := make(chan struct{}) // Channel to signal stop
-	mu.Lock()
-	portMap[cfg.PortName] = s
-	stopChMap[cfg.PortName] = stopCh
-	mu.Unlock()
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	formatted := fmt.Sprintf("[%s] %s", timestamp, strings.TrimSpace(data))
+
+	// Use Fyne's thread-safe UI update
+	fyne.CurrentApp().SendNotification(&fyne.Notification{
+		Title:   "Serial Data Received",
+		Content: strings.TrimSpace(data),
+	})
 
 	go func() {
-		defer func() {
-			mu.Lock()
-			delete(portMap, cfg.PortName)
-			delete(stopChMap, cfg.PortName)
-			mu.Unlock()
-			s.Close()
-		}()
+		currentText := sm.receivedData.Text
+		newText := formatted
+		if currentText != "" {
+			newText = currentText + "\n" + formatted
+		}
 
-		buf := make([]byte, 128) // Buffer for reading data
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				n, err := s.Read(buf)
-				if err != nil {
-					return
-				}
-				data := string(buf[:n])
-				timestamp := time.Now().Format("2006-01-02 15:04:05")
-				formatted := "[" + timestamp + "] " + data
-
-				// Show notification for received data
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Serial Data Received",
-					Content: data,
-				})
-
-				// Update UI safely
-				if drv, ok := fyne.CurrentApp().Driver().(interface{ Schedule(func()) }); ok {
-					drv.Schedule(func() {
-						currentText := receivedData.Text
-						if currentText == "" {
-							receivedData.SetText(formatted)
-						} else {
-							receivedData.SetText(currentText + "\n" + formatted)
-						}
-						receivedData.CursorRow = len(receivedData.Text) - 1
-						receivedData.Refresh()
-					})
-				} else {
-					currentText := receivedData.Text
-					if currentText == "" {
-						receivedData.SetText(formatted)
-					} else {
-						receivedData.SetText(currentText + "\n" + formatted)
-					}
-					receivedData.CursorRow = len(receivedData.Text) - 1
-					receivedData.Refresh()
-				}
+		// Limit text length to prevent memory issues
+		if len(newText) > MaxTextLength {
+			lines := strings.Split(newText, "\n")
+			if len(lines) > 100 {
+				lines = lines[len(lines)-100:]
+				newText = strings.Join(lines, "\n")
 			}
+		}
+
+		// Use Fyne's QueueUpdate or fallback to RunOnMain for compatibility
+		driver := fyne.CurrentApp().Driver()
+		if runner, ok := driver.(interface{ RunOnMain(func()) }); ok {
+			runner.RunOnMain(func() {
+				sm.receivedData.SetText(newText)
+				sm.receivedData.CursorRow = len(strings.Split(newText, "\n")) - 1
+			})
+		} else {
+			// fallback: just set directly (unsafe, but avoids build error)
+			sm.receivedData.SetText(newText)
+			sm.receivedData.CursorRow = len(strings.Split(newText, "\n")) - 1
 		}
 	}()
 }
 
-// Stop reading from the serial port and clean up resources
-func stopSerial(cfg serial.PortConfig) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	if stopCh, ok := stopChMap[cfg.PortName]; ok {
-		close(stopCh)
-		delete(stopChMap, cfg.PortName)
-	}
-
-	if port, ok := portMap[cfg.PortName]; ok && port != nil {
-		port.Close()
-		delete(portMap, cfg.PortName)
+// sendNotification sends a system notification
+func (sm *SerialManager) sendNotification(data string) {
+	if app := fyne.CurrentApp(); app != nil {
+		app.SendNotification(&fyne.Notification{
+			Title:   "Serial Data Received",
+			Content: strings.TrimSpace(data),
+		})
 	}
 }
 
-// Initialize the SQLite database and create the table if it doesn't exist
-func initSerialDB() error {
+// stopSerial stops reading from a serial port
+func (sm *SerialManager) stopSerial(cfg serial.PortConfig) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.stopSerialUnsafe(cfg)
+}
+
+// stopSerialUnsafe stops serial without locking (assumes lock is held)
+func (sm *SerialManager) stopSerialUnsafe(cfg serial.PortConfig) {
+	if stopCh, ok := sm.stopChMap[cfg.PortName]; ok {
+		close(stopCh)
+		delete(sm.stopChMap, cfg.PortName)
+	}
+
+	if port, ok := sm.portMap[cfg.PortName]; ok && port != nil {
+		port.Close()
+		delete(sm.portMap, cfg.PortName)
+	}
+}
+
+// showDeleteConfirmDialog shows confirmation dialog before deleting
+func (sm *SerialManager) showDeleteConfirmDialog(cfg serial.PortConfig, idx int, configList *fyne.Container) {
+	win := getCurrentWindow()
+	if win == nil {
+		return
+	}
+
+	dialog.ShowConfirm(
+		"Delete Configuration",
+		fmt.Sprintf("Are you sure you want to delete the configuration '%s'?", cfg.ConfigName),
+		func(confirm bool) {
+			if confirm {
+				sm.deleteConfiguration(cfg, idx, configList)
+			}
+		},
+		win,
+	)
+}
+
+// deleteConfiguration deletes a configuration
+func (sm *SerialManager) deleteConfiguration(cfg serial.PortConfig, idx int, configList *fyne.Container) {
+	// Stop if running
+	sm.mu.RLock()
+	isRunning := idx < len(sm.runningStates) && sm.runningStates[idx]
+	sm.mu.RUnlock()
+
+	if isRunning {
+		sm.stopSerial(cfg)
+	}
+
+	// Delete from database
+	if err := sm.deleteConfig(cfg); err != nil {
+		log.Printf("Failed to delete config from database: %v", err)
+		if win := getCurrentWindow(); win != nil {
+			dialog.ShowError(err, win)
+		}
+		return
+	}
+
+	// Remove from memory
+	sm.mu.Lock()
+	if idx < len(sm.configs) {
+		sm.configs = append(sm.configs[:idx], sm.configs[idx+1:]...)
+	}
+	if idx < len(sm.runningStates) {
+		sm.runningStates = append(sm.runningStates[:idx], sm.runningStates[idx+1:]...)
+	}
+	sm.mu.Unlock()
+
+	sm.updateConfigList(configList)
+}
+
+// Database operations
+func (sm *SerialManager) initDatabase() error {
 	var err error
-	db, err = sql.Open("sqlite3", "serial_configs.db")
+	sm.db, err = sql.Open("sqlite3", "serial_configs.db")
 	if err != nil {
 		return err
 	}
+
 	createTable := `CREATE TABLE IF NOT EXISTS serial_configs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		port_name TEXT,
-		config_name TEXT,
-		baud_rate TEXT,
-		data_bits TEXT,
-		parity TEXT,
-		stop_bits TEXT
+		port_name TEXT NOT NULL,
+		config_name TEXT NOT NULL UNIQUE,
+		baud_rate TEXT NOT NULL,
+		data_bits TEXT NOT NULL,
+		parity TEXT NOT NULL,
+		stop_bits TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
-	_, err = db.Exec(createTable)
+
+	_, err = sm.db.Exec(createTable)
 	return err
 }
 
-// Insert a serial port configuration into the database
-func insertSerialConfig(cfg serial.PortConfig) error {
-	_, err := db.Exec(`INSERT INTO serial_configs (port_name, config_name, baud_rate, data_bits, parity, stop_bits) VALUES (?, ?, ?, ?, ?, ?)`,
+func (sm *SerialManager) insertConfig(cfg serial.PortConfig) error {
+	_, err := sm.db.Exec(`INSERT INTO serial_configs 
+		(port_name, config_name, baud_rate, data_bits, parity, stop_bits) 
+		VALUES (?, ?, ?, ?, ?, ?)`,
 		cfg.PortName, cfg.ConfigName, cfg.BaudRate, cfg.DataBits, cfg.Parity, cfg.StopBits)
 	return err
 }
 
-// Load all serial port configurations from the database
-func loadSerialConfigs() ([]serial.PortConfig, error) {
-	rows, err := db.Query(`SELECT port_name, config_name, baud_rate, data_bits, parity, stop_bits FROM serial_configs`)
+func (sm *SerialManager) loadConfigs() ([]serial.PortConfig, error) {
+	rows, err := sm.db.Query(`SELECT port_name, config_name, baud_rate, data_bits, parity, stop_bits 
+		FROM serial_configs ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+
 	var configs []serial.PortConfig
 	for rows.Next() {
 		var cfg serial.PortConfig
-		if err := rows.Scan(&cfg.PortName, &cfg.ConfigName, &cfg.BaudRate, &cfg.DataBits, &cfg.Parity, &cfg.StopBits); err != nil {
+		if err := rows.Scan(&cfg.PortName, &cfg.ConfigName, &cfg.BaudRate,
+			&cfg.DataBits, &cfg.Parity, &cfg.StopBits); err != nil {
+			log.Printf("Error scanning config row: %v", err)
 			continue
 		}
 		configs = append(configs, cfg)
 	}
-	return configs, nil
+
+	return configs, rows.Err()
 }
 
-// Delete all serial port configurations from the database
-func clearSerialConfigs() error {
-	_, err := db.Exec(`DELETE FROM serial_configs`)
+func (sm *SerialManager) deleteConfig(cfg serial.PortConfig) error {
+	_, err := sm.db.Exec(`DELETE FROM serial_configs WHERE config_name = ?`, cfg.ConfigName)
 	return err
+}
+
+// Helper function to get current window
+func getCurrentWindow() fyne.Window {
+	if app := fyne.CurrentApp(); app != nil {
+		windows := app.Driver().AllWindows()
+		if len(windows) > 0 {
+			return windows[0]
+		}
+	}
+	return nil
 }
