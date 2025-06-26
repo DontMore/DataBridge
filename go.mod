@@ -1,10 +1,18 @@
 module DataBridge
 
-go 1.21
+go 1.23.0
+
+toolchain go1.24.3
 
 require (
 	fyne.io/fyne/v2 v2.4.1
 	github.com/tarm/serial v0.0.0-20180830185346-98f6abe2eb07
+)
+
+require (
+	github.com/creack/goselect v0.1.2 // indirect
+	github.com/mattn/go-sqlite3 v1.14.28 // indirect
+	go.bug.st/serial v1.6.4 // indirect
 )
 
 require (
@@ -31,7 +39,7 @@ require (
 	golang.org/x/image v0.11.0 // indirect
 	golang.org/x/mobile v0.0.0-20230531173138-3c911d8e3eda // indirect
 	golang.org/x/net v0.14.0 // indirect
-	golang.org/x/sys v0.11.0 // indirect
+	golang.org/x/sys v0.33.0
 	golang.org/x/text v0.12.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	honnef.co/go/js/dom v0.0.0-20210725211120-f030747120f2 // indirect
