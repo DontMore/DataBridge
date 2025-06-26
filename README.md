@@ -45,7 +45,7 @@ DataBridge is a cross-platform desktop application for monitoring and managing s
 ### Installation
 1. Clone this repository:
    ```sh
-   git clone https://github.com/yourusername/DataBridge.git
+   git clone https://github.com/DontMore/DataBridge.git
    cd DataBridge
    ```
 2. Download dependencies:
@@ -91,7 +91,7 @@ Contributions, issues, and feature requests are welcome! Please open an issue or
 
 ## Author
 
-- [Your Name](https://github.com/yourusername)
+- [Muhardi](https://github.com/DontMore)
 
 ---
 
