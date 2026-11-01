@@ -24,7 +24,7 @@ func getPortList() []string {
 // It initializes the Fyne app, creates the main window, header, and tabs,
 // and sets up the main layout and window properties.
 func main() {
-	myApp := app.New()                                         // Create a new Fyne application
+	myApp := app.NewWithID("com.databridge.app")                                     // Create a new Fyne application
 	myWindow := myApp.NewWindow("DataBridge - Serial Monitor") // Create the main window
 
 	header, fullscreenBtn := ui.MakeHeader(myWindow) // Create header and fullscreen button
